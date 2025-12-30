@@ -1,6 +1,6 @@
 """
 simple_ppo_train.py - Single-file PPO trainer for Trackmania
-FIXED: Only forward actions allowed (6 actions instead of 12)
+FIXED: Learns from EVERY rollout, even partial/crashed ones
 """
 
 import sys
@@ -23,21 +23,25 @@ from trackmania_rl.map_loader import analyze_map_cycle, load_next_map_zone_cente
 from trackmania_rl.tmi_interaction import game_instance_manager
 from trackmania_rl.utilities import set_random_seed
 
-# ACTION MAPPING - Only forward actions allowed
-# Network outputs 0-5, we map to game actions:
-# Game actions: 0=forward, 1=forward+left, 2=forward+right (all have accelerate=True)
-# We use these 3 forward actions with duplicates for exploration diversity
-ALLOWED_ACTIONS = [0, 1, 2, 0, 1, 2]  # forward, fwd+left, fwd+right, forward, fwd+left, fwd+right
-ACTION_NAMES_SIMPLE = ["forward", "fwd+left", "fwd+right", "forward2", "fwd+left2", "fwd+right2"]
+# Import action names for debugging
+try:
+    from config_files.inputs_list import keyboard_actions_list
+    ACTION_NAMES = [str(action) for action in keyboard_actions_list]
+    print("Action mapping loaded:")
+    for i, name in enumerate(ACTION_NAMES):
+        print(f"  Action {i}: {name}")
+    print()
+except:
+    ACTION_NAMES = [f"Action_{i}" for i in range(12)]
 
 # ============================================================================
-# PPO NETWORK - 6 ACTIONS ONLY
+# PPO NETWORK
 # ============================================================================
 
 class SimplePPONetwork(nn.Module):
-    """Lightweight PPO Actor-Critic Network - ONLY 6 FORWARD ACTIONS"""
+    """Lightweight PPO Actor-Critic Network"""
     
-    def __init__(self, num_actions=6, float_input_dim=184):
+    def __init__(self, num_actions=12, float_input_dim=184):
         super().__init__()
         
         self.float_input_dim = float_input_dim
@@ -50,9 +54,14 @@ class SimplePPONetwork(nn.Module):
         # Float processing
         self.float_fc = nn.Linear(float_input_dim, 128)
         
+        # Calculate conv output size dynamically
+        # After conv layers: (120-4)/2+1 = 59, (160-4)/2+1 = 79
+        #                   (59-4)/2+1 = 28, (79-4)/2+1 = 38
+        #                   (28-3)/1+1 = 26, (38-3)/1+1 = 36
+        # conv_out = 32 * 26 * 36 = 29952
         conv_output_size = 32 * 26 * 36
         
-        # Combined
+        # Combined (smaller to speed up)
         self.fc_shared = nn.Linear(conv_output_size + 128, 256)
         
         # Heads
@@ -68,8 +77,8 @@ class SimplePPONetwork(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
         
-        # Higher gain for actor to start with more confident predictions (prevents getting stuck)
-        nn.init.orthogonal_(self.actor.weight, gain=0.1)  # Increased from 0.01
+        # Small gain for actor to start uniform
+        nn.init.orthogonal_(self.actor.weight, gain=0.01)
         nn.init.constant_(self.actor.bias, 0)
         
     def forward(self, img, float_input):
@@ -122,12 +131,8 @@ class FastPPOInferer:
         self.reset_rollout_storage()
         
         # Action counters
-        self.action_counts = np.zeros(6)
-        self.last_action = 0  # Network action 0 = game action 0 (forward)
-        
-        # Stuck detection
-        self.consecutive_same_action = 0
-        self.last_episode_action_dist = None
+        self.action_counts = np.zeros(12)
+        self.last_action = 2  # Start with forward
         
     def reset_rollout_storage(self):
         """Clear rollout storage for new episode"""
@@ -143,10 +148,9 @@ class FastPPOInferer:
         
         # WARMUP: Random forward actions
         if self.episode_count < self.warmup_episodes:
-            network_action = np.random.choice([0, 1, 2, 3, 4, 5], 
-                                             p=[0.3, 0.15, 0.15, 0.15, 0.15, 0.1])
-            game_action = ALLOWED_ACTIONS[network_action]
-            return (game_action, True, 0.0, np.ones(6) / 6)
+            action = np.random.choice([2, 3, 4, 5, 6, 7, 8, 9, 10, 11], 
+                                     p=[0.3, 0.1, 0.1, 0.1, 0.1, 0.1, 0.05, 0.05, 0.05, 0.05])
+            return (action, True, 0.0, np.ones(12) / 12)
         
         try:
             # Fast preprocessing
@@ -156,92 +160,98 @@ class FastPPOInferer:
             obs_tensor = torch.from_numpy(obs).unsqueeze(0).float().to(self.device)
             float_tensor = torch.from_numpy(float_input).unsqueeze(0).float().to(self.device)
             
-            # Get action and value
+            # Get action and value (STORE THIS TIME!)
             with torch.no_grad():
                 action_logits, value = self.network(obs_tensor, float_tensor)
                 
-                # DETECT IF STUCK: If same action repeated many times, force exploration
-                if len(self.stored_actions) > 20:
-                    recent_actions = self.stored_actions[-20:]
-                    if len(set(recent_actions)) == 1:  # All same action
-                        self.consecutive_same_action += 1
-                        if self.consecutive_same_action > 3:
-                            print(f"    ⚠️  STUCK DETECTED: Same action {recent_actions[0]} repeated 20+ times! Forcing random action.")
-                            network_action = torch.tensor(np.random.choice([0, 1, 2, 3, 4, 5]), device=self.device)
-                            log_prob = torch.tensor(0.0, device=self.device)
-                            probs = torch.ones(6, device=self.device) / 6.0
-                            network_action_int = int(network_action.cpu().item())
-                            log_prob_float = float(log_prob.cpu().item())
-                            value_float = float(value.squeeze().cpu().item())
-                            game_action = ALLOWED_ACTIONS[network_action_int]
-                            self.stored_obs.append(obs.copy())
-                            self.stored_floats.append(float_input.copy())
-                            self.stored_actions.append(network_action_int)
-                            self.stored_log_probs.append(log_prob_float)
-                            self.stored_values.append(value_float)
-                            self.action_counts[network_action_int] += 1
-                            self.last_action = network_action_int
-                            return (game_action, True, value_float, probs.squeeze().cpu().numpy())
-                    else:
-                        self.consecutive_same_action = 0
-                
-                # ADD EXPLORATION NOISE to prevent getting stuck
-                # After warmup, add 20% random exploration (increased if stuck recently)
-                exploration_rate = 0.20 + (0.10 * min(self.consecutive_same_action, 3))
-                use_random = np.random.random() < exploration_rate
-                if use_random:
-                    network_action = torch.tensor(np.random.choice([0, 1, 2, 3, 4, 5]), device=self.device)
-                    log_prob = torch.tensor(0.0, device=self.device)
-                    probs = torch.ones(6, device=self.device) / 6.0
-                else:
-                    # Sample action from policy
-                    dist = torch.distributions.Categorical(logits=action_logits)
-                    network_action = dist.sample()
-                    log_prob = dist.log_prob(network_action)
-                    probs = torch.softmax(action_logits, dim=-1)
-                
-                # DEBUG: Print action selection on first few steps of each episode
-                if self.step_count <= 5:
+                # DEBUG: Print raw logits on first few steps
+                if self.step_count <= 3:
                     logits_np = action_logits.squeeze().cpu().numpy()
-                    probs_np = probs.squeeze().cpu().numpy()
-                    print(f"    [Step {self.step_count}] Logits: {logits_np.round(2)}")
-                    print(f"    [Step {self.step_count}] Probs: {probs_np.round(3)}")
-                    print(f"    [Step {self.step_count}] Selected: {network_action.item()} → Game action {ALLOWED_ACTIONS[network_action.item()]}")
+                    print(f"  [Step {self.step_count}] Raw logits: {logits_np.round(2)}")
+                
+                # AGGRESSIVE ACTION MASKING - EXPANDED
+                # Based on debug output: Action 7 is causing backward movement!
+                
+                # Action 0: Usually "no input" - mask at start
+                if self.step_count < 100:
+                    action_logits[:, 0] = -1e9
+                
+                # MASK ALL BACKWARD/BRAKE ACTIONS
+                # Typical TrackMania action mapping:
+                # 0=none, 1=down, 2=up, 3=left, 4=right, 5=up+left, 6=up+right
+                # 7=down+left, 8=down+right, 9=left+brake, 10=right+brake, etc.
+                
+                backward_actions = [1, 7, 8]  # down, down+left, down+right
+                for action_idx in backward_actions:
+                    action_logits[:, action_idx] = -1e9
+                
+                # Also mask pure brake actions if they exist (usually 9, 10, 11)
+                # Uncomment if still having issues:
+                # action_logits[:, 9] = -1e9
+                # action_logits[:, 10] = -1e9
+                # action_logits[:, 11] = -1e9
+                
+                # DEBUG: Print masked logits
+                if self.step_count <= 3:
+                    masked_logits = action_logits.squeeze().cpu().numpy()
+                    print(f"  [Step {self.step_count}] Masked logits: {masked_logits.round(2)}")
+                
+                # Sample action and get log_prob
+                dist = torch.distributions.Categorical(logits=action_logits)
+                action = dist.sample()
+                log_prob = dist.log_prob(action)
+                probs = torch.softmax(action_logits, dim=-1)
+                
+                # DEBUG: Print selected action
+                if self.step_count <= 3:
+                    print(f"  [Step {self.step_count}] Selected action: {action.item()}")
+                    print(f"  [Step {self.step_count}] Probs: {probs.squeeze().cpu().numpy().round(3)}")
             
-            network_action_int = int(network_action.cpu().item())
-            log_prob_float = float(log_prob.cpu().item())
+            action_int = int(action.cpu().item())
+            
+            # HARD CHECK: If somehow backward actions got selected, override them
+            backward_actions = [1, 7, 8]  # down, down+left, down+right
+            if action_int in backward_actions:
+                print(f"  ❌ EMERGENCY: Action {action_int} (backward) was selected! Overriding to 2 (forward)")
+                action_int = 2  # Force forward instead
+                log_prob_float = 0.0
+            else:
+                log_prob_float = float(log_prob.cpu().item())
             value_float = float(value.squeeze().cpu().item())
             
-            # MAP to game action
-            game_action = ALLOWED_ACTIONS[network_action_int]
-            
-            # STORE DATA (store network action 0-5)
+            # STORE DATA FOR TRAINING
             self.stored_obs.append(obs.copy())
             self.stored_floats.append(float_input.copy())
-            self.stored_actions.append(network_action_int)
+            self.stored_actions.append(action_int)
             self.stored_log_probs.append(log_prob_float)
             self.stored_values.append(value_float)
             
-            self.action_counts[network_action_int] += 1
-            self.last_action = network_action_int
+            self.action_counts[action_int] += 1
+            self.last_action = action_int
             
-            return (game_action, True, value_float, probs.squeeze().cpu().numpy())
+            return (action_int, True, value_float, probs.squeeze().cpu().numpy())
             
         except Exception as e:
             print(f"    ! Inference error: {e}")
+            # Still store something so lengths match
             if len(self.stored_obs) > 0:
                 self.stored_obs.append(self.stored_obs[-1].copy())
                 self.stored_floats.append(self.stored_floats[-1].copy())
                 self.stored_actions.append(self.last_action)
                 self.stored_log_probs.append(0.0)
                 self.stored_values.append(0.0)
-            game_action = ALLOWED_ACTIONS[self.last_action]
-            return (game_action, True, 0.0, np.ones(6) / 6)
+            return (self.last_action, True, 0.0, np.ones(12) / 12)
     
     def get_stored_rollout_data(self):
         """Get stored rollout data"""
         if len(self.stored_obs) == 0:
             return None
+        
+        # Check if agent went backward too much (safety check)
+        backward_actions = [1, 7, 8]  # down, down+left, down+right
+        backward_count = sum(1 for a in self.stored_actions if a in backward_actions)
+        if backward_count > 10:
+            print(f"    ⚠ Warning: Agent used backward actions {backward_count} times")
             
         return {
             'obs': np.array(self.stored_obs, dtype=np.uint8),
@@ -255,7 +265,6 @@ class FastPPOInferer:
         self.episode_count += 1
         self.step_count = 0
         self.reset_rollout_storage()
-        self.consecutive_same_action = 0  # Reset stuck detection
         
         # Clear CUDA cache periodically
         if self.episode_count % 20 == 0:
@@ -266,13 +275,11 @@ class FastPPOInferer:
         if self.episode_count % 10 == 0:
             total = self.action_counts.sum()
             if total > 0:
-                dist_str = " ".join([f"{int(self.action_counts[i]/total*100):2d}" for i in range(6)])
+                dist_str = " ".join([f"{int(self.action_counts[i]/total*100):2d}" for i in range(12)])
                 print(f"  Action %: [{dist_str}]")
-                print(f"  (0=fwd, 1=fwd+left, 2=fwd+right, 3=fwd, 4=fwd+left, 5=fwd+right)")
-                # Check if agent is getting stuck on one action
-                max_action_pct = max(self.action_counts) / total * 100
-                if max_action_pct > 80:
-                    print(f"  ⚠️  WARNING: Agent stuck on one action ({max_action_pct:.1f}%)")
+                backward_pct = self.action_counts[1] / total * 100
+                if backward_pct > 1.0:
+                    print(f"  ⚠ BACKWARD USED {backward_pct:.1f}% of the time!")
                 self.action_counts.fill(0)
 
 # ============================================================================
@@ -423,13 +430,28 @@ class RobustGameManager:
             return None, None
 
 # ============================================================================
-# MAIN TRAINING LOOP
+# MAIN TRAINING LOOP - LEARNS FROM EVERY ROLLOUT
 # ============================================================================
 
 def main():
     print("=" * 70)
-    print("PPO TRAINING - ONLY 6 FORWARD ACTIONS (No backward possible)")
+    print("PPO TRAINING - Learns from ALL rollouts (even crashed ones)")
     print("=" * 70)
+    
+    # Print action mappings for debugging
+    print("\n🎮 ACTION MAPPINGS:")
+    try:
+        from config_files.inputs_list import keyboard_actions_list
+        for i, action in enumerate(keyboard_actions_list):
+            print(f"  [{i:2d}] {action}")
+        print("\n  Looking for BACKWARD action (usually has 'down' or 'brake' without forward)...")
+        for i, action in enumerate(keyboard_actions_list):
+            action_str = str(action).lower()
+            if 'down' in action_str or ('brake' in action_str and 'up' not in action_str):
+                print(f"  ⚠️  Action {i} might be BACKWARD: {action}")
+    except:
+        print("  Could not load action list")
+    print()
     
     set_random_seed(42)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -442,22 +464,21 @@ def main():
     
     # Get correct float input dimension
     actual_float_dim = config_copy.float_input_dim
-    print(f"Float input dim: {actual_float_dim}\n")
+    print(f"Float input dim: {actual_float_dim}")
+    print(f"  (27 + 3*{config_copy.n_zone_centers_in_inputs} + 4*{config_copy.n_prev_actions_in_inputs} + 4*{config_copy.n_contact_material_physics_behavior_types} + 1)\n")
     
-    # Create network with ONLY 6 ACTIONS
-    network = SimplePPONetwork(num_actions=6, float_input_dim=actual_float_dim).to(device)
+    # Create network with CORRECT dimension
+    network = SimplePPONetwork(num_actions=12, float_input_dim=actual_float_dim).to(device)
     optimizer = torch.optim.Adam(network.parameters(), lr=3e-4, eps=1e-5)
     
-    print(f"Network parameters: {sum(p.numel() for p in network.parameters()):,}")
-    print(f"Network outputs: 6 actions only")
-    print(f"Action mapping: {ALLOWED_ACTIONS}")
-    print(f"  Network 0-5 → Game actions: [0=fwd, 1=fwd+left, 2=fwd+right, 0=fwd, 1=fwd+left, 2=fwd+right]")
-    print(f"  All actions have accelerate=True (no backward/brake possible)\n")
+    print(f"Network parameters: {sum(p.numel() for p in network.parameters()):,}\n")
     
-    # Create fast inferer
+    # Create fast inferer with CORRECT dimension
     inferer = FastPPOInferer(network, device, actual_float_dim, warmup_episodes=5)
     print("Warmup: 5 episodes with random forward actions")
-    print("🚫 BACKWARD MOVEMENT IMPOSSIBLE - Only 6 forward actions exist\n")
+    print("🚫 BACKWARD ACTIONS PERMANENTLY DISABLED: [1, 7, 8]")
+    print("   (down, down+left, down+right)")
+    print("🚫 No-input disabled for first 100 steps\n")
     
     # Create robust game manager
     game_mgr = RobustGameManager(base_dir)
@@ -471,7 +492,7 @@ def main():
     zone_centers_filename = None
     
     print("=" * 70)
-    print("TRAINING STARTED")
+    print("TRAINING STARTED - Learning from EVERY run (crashed or not)")
     print("=" * 70)
     
     network.train()
@@ -504,9 +525,10 @@ def main():
             zone_centers=zone_centers
         )
         
-        # Get stored data from inferer
+        # Get stored data from inferer (THIS IS KEY!)
         stored_data = inferer.get_stored_rollout_data()
         
+        # Even if rollout crashed, we have stored data!
         if stored_data is None or len(stored_data['obs']) < 10:
             print("✗ No data collected (too short)")
             continue
@@ -518,12 +540,27 @@ def main():
             rewards = np.array(rollout_results['rewards'], dtype=np.float32)
             race_time = end_race_stats.get('race_time', 0) / 1000
             finished = end_race_stats.get('race_finished', False)
+            
+            # PENALTY: Heavily penalize backward actions
+            backward_actions = [1, 7, 8]  # down, down+left, down+right
+            for i, action in enumerate(stored_data['actions']):
+                if action in backward_actions:  # Backward action
+                    rewards[i] -= 10.0  # HUGE penalty for going backward
+                if action == 0 and i < 100:  # No input at start
+                    rewards[i] -= 1.0  # Smaller penalty for being idle at start
+                    
         else:
             # CRASHED: Give penalty rewards
-            rewards = np.full(num_steps, -0.5, dtype=np.float32)
+            rewards = np.full(num_steps, -0.5, dtype=np.float32)  # Increased penalty
             race_time = 0
             finished = False
             print(f"  ⚠ Crashed/Incomplete rollout")
+            
+            # Extra penalty for backward actions in crashed runs
+            backward_actions = [1, 7, 8]  # down, down+left, down+right
+            for i, action in enumerate(stored_data['actions']):
+                if action in backward_actions:
+                    rewards[i] -= 20.0  # MASSIVE penalty if backward caused crash
         
         print(f"  {num_steps} steps, {race_time:.1f}s, {'FINISH' if finished else 'DNF/CRASH'}")
         
@@ -531,7 +568,7 @@ def main():
             best_time = race_time
             print(f"  🏆 NEW BEST: {best_time:.1f}s")
         
-        # ALWAYS TRAIN
+        # ALWAYS TRAIN (even on crashed runs!)
         if fill_buffer and num_steps > 50:
             try:
                 # Get last value for bootstrapping
@@ -546,7 +583,7 @@ def main():
                 
                 # Compute GAE
                 dones = np.zeros(num_steps, dtype=np.float32)
-                dones[-1] = 1.0
+                dones[-1] = 1.0  # Always treat end as done (crashed or finished)
                 
                 advantages, returns = compute_gae(
                     rewards, 
@@ -597,5 +634,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-            
-    
