@@ -39,7 +39,7 @@ ALLOWED_ACTIONS = [
 ]
 
 # ============================================================================
-# PPO NETWORK - 8 ACTIONS
+# PPO NETWORK
 # ============================================================================
 
 class SimplePPONetwork(nn.Module):
@@ -240,12 +240,7 @@ class FastPPOInferer:
 # ============================================================================
 
 def compute_enhanced_rewards(rollout_results, stored_data, num_steps):
-    """
-    BALANCED reward system:
-    - Zone progress: 50%
-    - Racing line: 30%
-    - Speed: 20%
-    """
+   
     rewards = np.zeros(num_steps, dtype=np.float32)
     
     if rollout_results is None:
@@ -293,7 +288,7 @@ def compute_enhanced_rewards(rollout_results, stored_data, num_steps):
         current_zone = int(zones[i])
         prev_zone = int(zones[i-1])
         
-        # === 1. ZONE PROGRESS (50% of per-step reward) ===
+        # === 1. ZONE PROGRESS =
         zone_progress = current_zone - prev_zone
         
         if zone_progress > 0:
@@ -321,15 +316,11 @@ def compute_enhanced_rewards(rollout_results, stored_data, num_steps):
             steps_in_same_zone += 1
             reward -= 0.2  # Small penalty
         
-        # === 2. RACING LINE (30% - ALWAYS ACTIVE) ===
+        # === 2. RACING LINE 
         if distances_to_line is not None:
             distance = abs(distances_to_line[i])
             
-            # Strong exponential reward for staying on line
-            # Perfect line (dist=0): +6.0
-            # dist=1: +4.5
-            # dist=2: +2.7  
-            # dist=5: +0.7
+           
             racing_line_reward = 6.0 * np.exp(-distance / 3.0)
             reward += racing_line_reward
             
@@ -337,7 +328,7 @@ def compute_enhanced_rewards(rollout_results, stored_data, num_steps):
             if distance > 5.0:
                 reward -= (distance - 5.0) * 1.0  # Increased penalty
         
-        # === 3. SPEED (20% - CONTEXT DEPENDENT) ===
+        # === 3. SPEED 
         if current_zone >= max_zone_so_far:
             # Reward speed in new zones
             base_speed_reward = min(speeds[i] / 100.0, 4.0)  # Max +4.0
