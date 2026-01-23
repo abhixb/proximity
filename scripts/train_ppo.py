@@ -1,7 +1,4 @@
-"""
-simple_ppo_train.py - Single-file PPO trainer for Trackmania
-COMPLETE VERSION: 8 Actions + Racing Line Rewards + All Fixes
-"""
+
 
 import sys
 from pathlib import Path
@@ -25,7 +22,7 @@ from trackmania_rl.map_loader import analyze_map_cycle, load_next_map_zone_cente
 from trackmania_rl.tmi_interaction import game_instance_manager
 from trackmania_rl.utilities import set_random_seed
 
-# ACTION MAPPING - 9 ACTIONS WITH BACKWARD
+
 ALLOWED_ACTIONS = [
     2,   # 0: forward
     3,   # 1: left
@@ -38,32 +35,27 @@ ALLOWED_ACTIONS = [
     2    # 8: forward (duplicate)
 ]
 
-# ============================================================================
-# PPO NETWORK
-# ============================================================================
 
 class SimplePPONetwork(nn.Module):
-    """PPO Network with ENHANCED float feature processing"""
+    """Lightweight PPO Actor-Critic Network"""
     
     def __init__(self, num_actions=9, float_input_dim=184):
         super().__init__()
         
         self.float_input_dim = float_input_dim
         
-        # Conv layers for visual processing
-        self.conv1 = nn.Conv2d(4, 16, kernel_size=4, stride=2)  # 4 stacked frames
+        # Smaller network for faster inference
+        self.conv1 = nn.Conv2d(1, 16, kernel_size=4, stride=2)
         self.conv2 = nn.Conv2d(16, 32, kernel_size=4, stride=2)
         self.conv3 = nn.Conv2d(32, 32, kernel_size=3, stride=1)
         
-        # ENHANCED float processing - bigger network for lookahead info
-        self.float_fc1 = nn.Linear(float_input_dim, 256)  # Increased from 128
-        self.float_fc2 = nn.Linear(256, 256)  # Additional layer
+        # Float processing
+        self.float_fc = nn.Linear(float_input_dim, 128)
         
         conv_output_size = 32 * 26 * 36
         
-        # Combined - give float features more weight
-        self.fc_shared = nn.Linear(conv_output_size + 256, 512)  # Larger
-        self.fc_shared2 = nn.Linear(512, 256)  # Additional layer
+        # Combined
+        self.fc_shared = nn.Linear(conv_output_size + 128, 256)
         
         # Heads
         self.actor = nn.Linear(256, num_actions)
@@ -82,7 +74,6 @@ class SimplePPONetwork(nn.Module):
         nn.init.constant_(self.actor.bias, 0)
         
     def forward(self, img, float_input):
-        # Process image
         if img.dtype == torch.uint8:
             img = img.float()
         img = img / 255.0
@@ -92,14 +83,10 @@ class SimplePPONetwork(nn.Module):
         x = F.relu(self.conv3(x))
         x = x.reshape(x.size(0), -1)
         
-        # ENHANCED float processing - deeper network for lookahead
-        f = F.relu(self.float_fc1(float_input))
-        f = F.relu(self.float_fc2(f))  # Additional processing
+        f = F.relu(self.float_fc(float_input))
         
-        # Combine
         combined = torch.cat([x, f], dim=1)
         shared = F.relu(self.fc_shared(combined))
-        shared = F.relu(self.fc_shared2(shared))  # Additional layer
         
         action_logits = self.actor(shared)
         value = self.critic(shared)
@@ -118,12 +105,9 @@ class SimplePPONetwork(nn.Module):
         _, value = self.forward(img, float_input)
         return value.squeeze(-1)
 
-# ============================================================================
-# FAST PPO INFERER
-# ============================================================================
 
 class FastPPOInferer:
-    """Fast inferer that stores rollout data for learning"""
+    
     
     def __init__(self, network, device, float_input_dim, warmup_episodes=20):
         self.network = network
@@ -232,15 +216,13 @@ class FastPPOInferer:
             if total > 0:
                 action_names = ['Fwd', 'Lft', 'Rgt', 'F+L', 'F+R', 'Brk', 'Bck', 'Fw2', 'Fw3']
                 dist_str = " ".join([f"{action_names[i]}:{int(self.action_counts[i]/total*100):2d}%" for i in range(9)])
-                print(f"  Actions: {dist_str} | Temp: {self.temperature:.2f}")
+                print(f"    Actions: {dist_str} | Temp: {self.temperature:.2f}")
                 self.action_counts.fill(0)
 
-# ============================================================================
-# RACING LINE REWARD COMPUTATION
-# ============================================================================
+
 
 def compute_enhanced_rewards(rollout_results, stored_data, num_steps):
-   
+    
     rewards = np.zeros(num_steps, dtype=np.float32)
     
     if rollout_results is None:
@@ -252,7 +234,7 @@ def compute_enhanced_rewards(rollout_results, stored_data, num_steps):
     speeds = rollout_results.get('speed', None)
     distances_to_line = rollout_results.get('dist_to_refline', None)
     
-    # Convert to arrays
+    
     if zones is not None:
         if isinstance(zones, list):
             zones = np.array(zones)
@@ -271,7 +253,7 @@ def compute_enhanced_rewards(rollout_results, stored_data, num_steps):
     else:
         distances_to_line = None
     
-    # Pad arrays
+  
     if len(zones) < num_steps:
         zones = np.pad(zones, (0, num_steps - len(zones)), constant_values=zones[-1] if len(zones) > 0 else 0)
     if len(speeds) < num_steps:
@@ -288,65 +270,63 @@ def compute_enhanced_rewards(rollout_results, stored_data, num_steps):
         current_zone = int(zones[i])
         prev_zone = int(zones[i-1])
         
-        # === 1. ZONE PROGRESS =
+       
         zone_progress = current_zone - prev_zone
         
         if zone_progress > 0:
-            # Moderate reward for zones
-            base_reward = 50.0  # Reduced from 300
+            
+            base_reward = 50.0
             if current_zone < 20:
-                base_reward = 60.0  # Reduced from 300
+                base_reward = 60.0
             elif current_zone < 50:
-                base_reward = 55.0  # Reduced from 240
+                base_reward = 55.0
             
             reward += zone_progress * base_reward
             max_zone_so_far = max(max_zone_so_far, current_zone)
             steps_in_same_zone = 0
             
-            # Momentum bonus
+            
             if i > 1 and zones[i-2] < prev_zone:
-                reward += 15.0  # Reduced from 50
+                reward += 15.0
                 
         elif zone_progress < 0:
-            # Penalty for going backward
-            reward -= 75.0 * abs(zone_progress)  # Reduced from 300
+            
+            reward -= 75.0 * abs(zone_progress)
             
         else:
-            # Same zone
+            
             steps_in_same_zone += 1
-            reward -= 0.2  # Small penalty
+            reward -= 0.2
         
-        # === 2. RACING LINE 
+        
         if distances_to_line is not None:
             distance = abs(distances_to_line[i])
             
-           
+            # Strong exponential reward for staying on line
             racing_line_reward = 6.0 * np.exp(-distance / 3.0)
             reward += racing_line_reward
             
             # Additional penalty for being very far off
             if distance > 5.0:
-                reward -= (distance - 5.0) * 1.0  # Increased penalty
+                reward -= (distance - 5.0) * 1.0
         
-        # === 3. SPEED 
+        
         if current_zone >= max_zone_so_far:
             # Reward speed in new zones
-            base_speed_reward = min(speeds[i] / 100.0, 4.0)  # Max +4.0
+            base_speed_reward = min(speeds[i] / 100.0, 4.0)
             
-            # Modulate speed by racing line (go fast on line, slow off line)
+            # Modulate speed by racing line
             if distances_to_line is not None:
                 distance = abs(distances_to_line[i])
-                # On line: full speed reward
-                # Off line: reduced speed reward
                 speed_multiplier = np.exp(-distance / 4.0)
                 base_speed_reward *= speed_multiplier
             
             reward += base_speed_reward
         else:
-            # Backtracking - small penalty
+            
             reward -= min(speeds[i] / 200.0, 0.5)
         
-        # === 4. STUCK PENALTY ===
+       
         if steps_in_same_zone > 15:
             reward -= 3.0
         if steps_in_same_zone > 40:
@@ -354,15 +334,14 @@ def compute_enhanced_rewards(rollout_results, stored_data, num_steps):
         
         rewards[i] = reward
     
-    # === END-OF-EPISODE BONUSES ===
+  
     
     if rollout_results.get('race_finished', False):
         rewards[-1] += 2000.0
-        print("  RACE FINISHED!")
+        print("    RACE FINISHED!")
     
     max_zone_reached = int(zones.max()) if len(zones) > 0 else 0
     if max_zone_reached > 0:
-        # Zone progress bonus (reduced importance)
         progress_bonus = (max_zone_reached ** 1.2) * 3.0
         rewards[-1] += progress_bonus
     
@@ -370,14 +349,11 @@ def compute_enhanced_rewards(rollout_results, stored_data, num_steps):
     if distances_to_line is not None and max_zone_reached > 5:
         avg_distance = np.mean(np.abs(distances_to_line))
         
-        # Big bonus for staying on line throughout episode
         if avg_distance < 3.0:
-            # Quadratic bonus: closer = exponentially better
             racing_line_bonus = (3.0 - avg_distance) ** 2 * max_zone_reached * 2.0
             rewards[-1] += racing_line_bonus
             
             if avg_distance < 1.5:
-                # Extra bonus for excellent line
                 rewards[-1] += 200.0
     
     # Milestones
@@ -402,9 +378,7 @@ def compute_enhanced_rewards(rollout_results, stored_data, num_steps):
     
     return rewards
 
-# ============================================================================
-# COMPUTE GAE
-# ============================================================================
+
 
 def compute_gae(rewards, values, dones, last_value, gamma=0.99, gae_lambda=0.95):
     advantages = np.zeros(len(rewards), dtype=np.float32)
@@ -418,9 +392,7 @@ def compute_gae(rewards, values, dones, last_value, gamma=0.99, gae_lambda=0.95)
     
     return advantages, advantages + values
 
-# ============================================================================
-# PPO UPDATE
-# ============================================================================
+
 
 CURRENT_ENTROPY_COEF = 0.10
 
@@ -487,9 +459,7 @@ def ppo_update(network, optimizer, rollout_data, device, epochs=4, batch_size=25
     
     return {k: v / num_updates for k, v in metrics.items()}
 
-# ============================================================================
-# METRICS TRACKER
-# ============================================================================
+
 
 class MetricsTracker:
     def __init__(self, save_dir, plot_every=10):
@@ -697,7 +667,7 @@ class MetricsTracker:
         plt.savefig(latest_path, dpi=100, bbox_inches='tight')
         plt.close()
         
-        print(f"  Plots saved to {plot_path.name}")
+        print(f"    Plots saved to {plot_path.name}")
     
     def get_summary_stats(self):
         return {
@@ -706,9 +676,8 @@ class MetricsTracker:
             'finish_rate': np.mean(self.finish_window) if self.finish_window else 0,
         }
 
-# ============================================================================
-# GAME MANAGER
-# ============================================================================
+
+
 
 class RobustGameManager:
     def __init__(self, base_dir):
@@ -768,13 +737,14 @@ class RobustGameManager:
             
             return None, None
 
-# ============================================================================
-# MAIN TRAINING LOOP
-# ============================================================================
 
 def main():
     print("=" * 70)
-   
+    print("PPO TRAINING - COMPLETE WITH RACING LINE REWARDS")
+    print("8 Actions (with brake)")
+    print("Racing line distance rewards")
+    print("All fixes applied")
+    print("=" * 70)
     
     set_random_seed(42)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -880,7 +850,6 @@ def main():
                 else:
                     episodes_since_improvement += 1
             
-            # Racing line stats
             if 'dist_to_refline' in rollout_results:
                 distances = rollout_results['dist_to_refline']
                 if isinstance(distances, list):
@@ -974,8 +943,20 @@ def main():
                   f"Finish={stats['finish_rate']*100:.0f}%")
             print(f"  Best Zone: {best_zone_ever} | No improvement: {episodes_since_improvement} eps")
         
-        if episodes_since_improvement > 100 and episode % 10 == 0:
-            print(f"  No improvement for {episodes_since_improvement} episodes (best: {best_zone_ever})")
+        if episodes_since_improvement > 50:
+            print(f"\n  STUCK! Resetting actor weights...")
+            
+            nn.init.orthogonal_(network.actor.weight, gain=0.01)
+            nn.init.constant_(network.actor.bias, 0)
+            
+            optimizer = torch.optim.Adam(network.parameters(), lr=3e-4, eps=1e-5)
+            
+            inferer.temperature = 2.5
+            entropy_coef = 0.20
+            episodes_since_improvement = 0
+            best_zone_ever = max(0, best_zone_ever - 10)
+            
+            print(f"  Reset complete. New target: {best_zone_ever}+")
         
         if episode % 25 == 0:
             save_path = save_dir / f"ppo_ep{episode}.pt"
