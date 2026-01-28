@@ -1,5 +1,3 @@
-
-
 import sys
 from pathlib import Path
 
@@ -23,6 +21,7 @@ from trackmania_rl.tmi_interaction import game_instance_manager
 from trackmania_rl.utilities import set_random_seed
 
 
+# FIXED: Removed duplicate forward actions
 ALLOWED_ACTIONS = [
     2,   # 0: forward
     3,   # 1: left
@@ -31,15 +30,13 @@ ALLOWED_ACTIONS = [
     6,   # 4: forward+right
     1,   # 5: brake
     0,   # 6: backward
-    2,   # 7: forward (duplicate)
-    2    # 8: forward (duplicate)
 ]
 
 
 class SimplePPONetwork(nn.Module):
     """Lightweight PPO Actor-Critic Network"""
     
-    def __init__(self, num_actions=9, float_input_dim=184):
+    def __init__(self, num_actions=7, float_input_dim=184):  # Changed to 7 actions
         super().__init__()
         
         self.float_input_dim = float_input_dim
@@ -108,7 +105,6 @@ class SimplePPONetwork(nn.Module):
 
 class FastPPOInferer:
     
-    
     def __init__(self, network, device, float_input_dim, warmup_episodes=20):
         self.network = network
         self.device = device
@@ -119,7 +115,7 @@ class FastPPOInferer:
         
         self.reset_rollout_storage()
         
-        self.action_counts = np.zeros(9)
+        self.action_counts = np.zeros(7)  # Changed to 7
         self.last_action = 0
         self.temperature = 2.0
         
@@ -134,10 +130,11 @@ class FastPPOInferer:
         self.step_count += 1
         
         if self.episode_count < self.warmup_episodes:
-            network_action = np.random.choice([0, 1, 2, 3, 4, 5, 6, 7, 8], 
-                                             p=[0.25, 0.1, 0.1, 0.15, 0.15, 0.1, 0.05, 0.05, 0.05])
+            # Random exploration with forward bias
+            network_action = np.random.choice([0, 1, 2, 3, 4, 5, 6], 
+                                             p=[0.3, 0.1, 0.1, 0.2, 0.2, 0.05, 0.05])
             game_action = ALLOWED_ACTIONS[network_action]
-            return (game_action, True, 0.0, np.ones(9) / 9)
+            return (game_action, True, 0.0, np.ones(7) / 7)
         
         try:
             if obs.ndim == 2:
@@ -147,16 +144,17 @@ class FastPPOInferer:
             float_tensor = torch.from_numpy(float_input).unsqueeze(0).float().to(self.device)
             
             with torch.no_grad():
+                # Get raw logits from network (NO temperature during rollout!)
                 action_logits, value = self.network(obs_tensor, float_tensor)
-                action_logits = action_logits / self.temperature
                 
+                # Create distribution and sample from RAW logits
                 dist = torch.distributions.Categorical(logits=action_logits)
                 network_action = dist.sample()
                 
-                original_logits, _ = self.network(obs_tensor, float_tensor)
-                original_dist = torch.distributions.Categorical(logits=original_logits)
-                log_prob = original_dist.log_prob(network_action)
+                # Calculate log_prob from the SAME distribution
+                log_prob = dist.log_prob(network_action)
                 
+                # Get probabilities for diagnostics
                 probs = torch.softmax(action_logits, dim=-1)
             
             network_action_int = int(network_action.cpu().item())
@@ -185,7 +183,7 @@ class FastPPOInferer:
                 self.stored_log_probs.append(0.0)
                 self.stored_values.append(0.0)
             game_action = ALLOWED_ACTIONS[self.last_action]
-            return (game_action, True, 0.0, np.ones(9) / 9)
+            return (game_action, True, 0.0, np.ones(7) / 7)
     
     def get_stored_rollout_data(self):
         if len(self.stored_obs) == 0:
@@ -204,8 +202,9 @@ class FastPPOInferer:
         self.step_count = 0
         self.reset_rollout_storage()
         
+        # FIXED: Slower temperature decay
         if self.episode_count > self.warmup_episodes:
-            self.temperature = max(1.0, 2.0 - (self.episode_count - self.warmup_episodes) * 0.003)
+            self.temperature = max(1.0, 2.0 - (self.episode_count - self.warmup_episodes) * 0.001)
         
         if self.episode_count % 20 == 0:
             torch.cuda.empty_cache()
@@ -214,26 +213,22 @@ class FastPPOInferer:
         if self.episode_count % 10 == 0:
             total = self.action_counts.sum()
             if total > 0:
-                action_names = ['Fwd', 'Lft', 'Rgt', 'F+L', 'F+R', 'Brk', 'Bck', 'Fw2', 'Fw3']
-                dist_str = " ".join([f"{action_names[i]}:{int(self.action_counts[i]/total*100):2d}%" for i in range(9)])
+                action_names = ['Fwd', 'Lft', 'Rgt', 'F+L', 'F+R', 'Brk', 'Bck']
+                dist_str = " ".join([f"{action_names[i]}:{int(self.action_counts[i]/total*100):2d}%" for i in range(7)])
                 print(f"    Actions: {dist_str} | Temp: {self.temperature:.2f}")
                 self.action_counts.fill(0)
 
 
-
 def compute_enhanced_rewards(rollout_results, stored_data, num_steps):
-    
     rewards = np.zeros(num_steps, dtype=np.float32)
     
     if rollout_results is None:
-        rewards.fill(-5.0)
+        rewards.fill(-0.001)
         return rewards
     
-    # Get data
     zones = rollout_results.get('current_zone_idx', None)
     speeds = rollout_results.get('speed', None)
     distances_to_line = rollout_results.get('dist_to_refline', None)
-    
     
     if zones is not None:
         if isinstance(zones, list):
@@ -253,7 +248,6 @@ def compute_enhanced_rewards(rollout_results, stored_data, num_steps):
     else:
         distances_to_line = None
     
-  
     if len(zones) < num_steps:
         zones = np.pad(zones, (0, num_steps - len(zones)), constant_values=zones[-1] if len(zones) > 0 else 0)
     if len(speeds) < num_steps:
@@ -270,52 +264,49 @@ def compute_enhanced_rewards(rollout_results, stored_data, num_steps):
         current_zone = int(zones[i])
         prev_zone = int(zones[i-1])
         
-       
         zone_progress = current_zone - prev_zone
         
         if zone_progress > 0:
-            
-            base_reward = 50.0
+            base_reward = 0.05
             if current_zone < 20:
-                base_reward = 60.0
+                base_reward = 0.06
             elif current_zone < 50:
-                base_reward = 55.0
+                base_reward = 0.055
             
             reward += zone_progress * base_reward
             max_zone_so_far = max(max_zone_so_far, current_zone)
             steps_in_same_zone = 0
             
-            
             if i > 1 and zones[i-2] < prev_zone:
-                reward += 15.0
+                reward += 0.01
                 
         elif zone_progress < 0:
-            
-            reward -= 75.0 * abs(zone_progress)
+            reward -= 0.08 * abs(zone_progress)
             
         else:
-            
             steps_in_same_zone += 1
-            reward -= 0.2
-        
+            reward -= 0.0002
         
         if distances_to_line is not None:
             distance = abs(distances_to_line[i])
             
-            # Strong exponential reward for staying on line
-            racing_line_reward = 6.0 * np.exp(-distance / 3.0)
-            reward += racing_line_reward
+            magnetic_pull = max(0, 0.004 * (1.0 - (distance / 30.0)))
+            precision_reward = 0.006 * np.exp(-distance / 4.0)
             
-            # Additional penalty for being very far off
+            reward += (magnetic_pull + precision_reward)
+            
+            if i > 0:
+                dist_prev = abs(distances_to_line[i-1])
+                if distance < dist_prev:
+                    improvement = dist_prev - distance
+                    reward += improvement * 0.003
+            
             if distance > 5.0:
-                reward -= (distance - 5.0) * 1.0
-        
+                reward -= (distance - 5.0) * 0.001
         
         if current_zone >= max_zone_so_far:
-            # Reward speed in new zones
-            base_speed_reward = min(speeds[i] / 100.0, 4.0)
+            base_speed_reward = min(speeds[i] / 100.0, 0.004)
             
-            # Modulate speed by racing line
             if distances_to_line is not None:
                 distance = abs(distances_to_line[i])
                 speed_multiplier = np.exp(-distance / 4.0)
@@ -323,62 +314,53 @@ def compute_enhanced_rewards(rollout_results, stored_data, num_steps):
             
             reward += base_speed_reward
         else:
-            
-            reward -= min(speeds[i] / 200.0, 0.5)
+            reward -= min(speeds[i] / 200.0, 0.0005)
         
-       
-        if steps_in_same_zone > 15:
-            reward -= 3.0
-        if steps_in_same_zone > 40:
-            reward -= 10.0
+        if steps_in_same_zone > 25:
+            reward -= 0.002
+        if steps_in_same_zone > 60:
+            reward -= 0.01
         
         rewards[i] = reward
     
-  
-    
     if rollout_results.get('race_finished', False):
-        rewards[-1] += 2000.0
-        print("    RACE FINISHED!")
+        rewards[-1] += 5.0
+        print("    RACE FINISHED")
     
     max_zone_reached = int(zones.max()) if len(zones) > 0 else 0
     if max_zone_reached > 0:
-        progress_bonus = (max_zone_reached ** 1.2) * 3.0
+        progress_bonus = (max_zone_reached ** 1.1) * 0.005
         rewards[-1] += progress_bonus
     
-    # RACING LINE ADHERENCE BONUS (MAJOR)
     if distances_to_line is not None and max_zone_reached > 5:
         avg_distance = np.mean(np.abs(distances_to_line))
         
         if avg_distance < 3.0:
-            racing_line_bonus = (3.0 - avg_distance) ** 2 * max_zone_reached * 2.0
+            racing_line_bonus = (3.0 - avg_distance) ** 2 * max_zone_reached * 0.002
             rewards[-1] += racing_line_bonus
             
             if avg_distance < 1.5:
-                rewards[-1] += 200.0
+                rewards[-1] += 0.5
     
-    # Milestones
     unique_zones = len(set([int(z) for z in zones]))
     if unique_zones >= 5:
-        rewards[-1] += 30.0
+        rewards[-1] += 0.05
     if unique_zones >= 10:
-        rewards[-1] += 60.0
+        rewards[-1] += 0.1
     if unique_zones >= 20:
-        rewards[-1] += 120.0
+        rewards[-1] += 0.2
     if unique_zones >= 30:
-        rewards[-1] += 240.0
+        rewards[-1] += 0.4
     if unique_zones >= 50:
-        rewards[-1] += 480.0
+        rewards[-1] += 0.8
     
-    # Time bonus
     if rollout_results.get('race_finished', False):
         race_time = rollout_results.get('race_time', 999999) / 1000.0
         if race_time < 90:
-            time_bonus = (90 - race_time) * 20.0
+            time_bonus = (90 - race_time) * 0.02
             rewards[-1] += time_bonus
     
     return rewards
-
-
 
 def compute_gae(rewards, values, dones, last_value, gamma=0.99, gae_lambda=0.95):
     advantages = np.zeros(len(rewards), dtype=np.float32)
@@ -391,7 +373,6 @@ def compute_gae(rewards, values, dones, last_value, gamma=0.99, gae_lambda=0.95)
         advantages[t] = last_gae_lam = delta + gamma * gae_lambda * next_non_terminal * last_gae_lam
     
     return advantages, advantages + values
-
 
 
 CURRENT_ENTROPY_COEF = 0.10
@@ -458,7 +439,6 @@ def ppo_update(network, optimizer, rollout_data, device, epochs=4, batch_size=25
             num_updates += 1
     
     return {k: v / num_updates for k, v in metrics.items()}
-
 
 
 class MetricsTracker:
@@ -677,8 +657,6 @@ class MetricsTracker:
         }
 
 
-
-
 class RobustGameManager:
     def __init__(self, base_dir):
         self.base_dir = base_dir
@@ -740,10 +718,10 @@ class RobustGameManager:
 
 def main():
     print("=" * 70)
-    print("PPO TRAINING - COMPLETE WITH RACING LINE REWARDS")
-    print("8 Actions (with brake)")
-    print("Racing line distance rewards")
-    print("All fixes applied")
+    print("PPO TRAINING - FIXED VERSION")
+    print("7 Actions (removed duplicates)")
+    print("Fixed log-prob calculation")
+    print("Smarter actor reset logic")
     print("=" * 70)
     
     set_random_seed(42)
@@ -757,7 +735,7 @@ def main():
     actual_float_dim = config_copy.float_input_dim
     print(f"Float input dim: {actual_float_dim}\n")
     
-    network = SimplePPONetwork(num_actions=9, float_input_dim=actual_float_dim).to(device)
+    network = SimplePPONetwork(num_actions=7, float_input_dim=actual_float_dim).to(device)
     optimizer = torch.optim.Adam(network.parameters(), lr=3e-4, eps=1e-5)
     
     print(f"Network parameters: {sum(p.numel() for p in network.parameters()):,}")
@@ -778,6 +756,7 @@ def main():
     set_maps_trained, set_maps_blind = analyze_map_cycle(config_copy.map_cycle)
     map_cycle_iter = cycle(chain(*config_copy.map_cycle))
     zone_centers_filename = None
+    zone_centers = None
     
     print("=" * 70)
     print("TRAINING STARTED")
@@ -943,22 +922,8 @@ def main():
                   f"Finish={stats['finish_rate']*100:.0f}%")
             print(f"  Best Zone: {best_zone_ever} | No improvement: {episodes_since_improvement} eps")
         
-        if episodes_since_improvement > 50:
-            print(f"\n  STUCK! Resetting actor weights...")
-            
-            nn.init.orthogonal_(network.actor.weight, gain=0.01)
-            nn.init.constant_(network.actor.bias, 0)
-            
-            optimizer = torch.optim.Adam(network.parameters(), lr=3e-4, eps=1e-5)
-            
-            inferer.temperature = 2.5
-            entropy_coef = 0.20
-            episodes_since_improvement = 0
-            best_zone_ever = max(0, best_zone_ever - 10)
-            
-            print(f"  Reset complete. New target: {best_zone_ever}+")
-        
-        if episode % 25 == 0:
+  
+    if episode % 25 == 0:
             save_path = save_dir / f"ppo_ep{episode}.pt"
             torch.save({
                 'episode': episode,
