@@ -74,10 +74,16 @@ This file tracks key PPO signals such as episodic return, policy loss, value los
 
 ## `ppo_rewards.py`
 
-- Task-specific reward shaping  
-- Reward scaling and decomposition  
+- Task-specific reward shaping
+- Reward scaling and decomposition
 
 This file defines how raw environment feedback is transformed into learning signals. It contains dense shaping terms, penalties, and terminal bonuses tailored to the task. Separating reward logic allows rapid iteration without modifying PPO mechanics.
+
+---
+
+## Inference
+
+<video src="assets/tmrlno.mp4" controls width="600"></video>
 
 
 
