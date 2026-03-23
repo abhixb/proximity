@@ -83,7 +83,7 @@ This file defines how raw environment feedback is transformed into learning sign
 
 ## Inference
 
-<video src="assets/tmrlno.mp4" controls width="600"></video>
+https://github.com/user-attachments/assets/158bc1fc-de16-4ea0-abb9-917bb6c5af8d
 
 
 
